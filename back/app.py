@@ -1,20 +1,69 @@
-from flask import Flask, request, jsonify
-from difflib import SequenceMatcher
+# app.py
+import os
+import sys
 import sqlite3
-from flask_cors import CORS  # 👈 импортируем
+import numpy as np
+import re
+import threading
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 app = Flask(__name__)
-CORS(app)  # 👈 разрешаем CORS для всех маршрутов
+CORS(app)
 
 DATABASE = 'database.db'
+MODEL_PATH = "./models/all-MiniLM-L6-v2"
 
+# === 1. ПРЕДОБРАБОТКА (для русского технического языка) ===
+def preprocess(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    # 🔧 Добавлены замены для программирования
+    for ru, en in {
+        # Общие
+        'список': 'list', 'массив': 'array', 'цикл': 'loop', 'функция': 'function',
+        'переменная': 'variable', 'строка': 'string', 'число': 'number',
+        'возвращает': 'returns', 'проверяет': 'checks', 'значение': 'value',
+        'параметр': 'parameter', 'аргумент': 'argument', 'метод': 'method',
+        # Циклы
+        'перебирает': 'iterates', 'проходит': 'iterates', 'выполняет': 'executes',
+        'элементы': 'elements', 'итерация': 'iteration', 'счётчик': 'counter',
+        'условие': 'condition', 'тело цикла': 'loop body',
+        # Ошибки
+        'стрелочк': 'arrow', 'типа': 'like', 'как бы': 'kind of',
+    }.items():
+        text = text.replace(ru, en)
+    return text
+
+# === 2. ЖЁСТКАЯ ЗАГРУЗКА МОДЕЛИ (без fallback) ===
+print("🔍 Загрузка модели из ./models/all-MiniLM-L6-v2...")
+model = SentenceTransformer(MODEL_PATH)
+print("✅ Модель успешно загружена")
+
+# === 3. КЭШ (опционально, для скорости) ===
+embedding_cache = {}
+cache_lock = threading.Lock()
+
+def get_embeddings(question_id, etalons):
+    with cache_lock:
+        if question_id not in embedding_cache:
+            texts = [preprocess(e) for e in etalons]
+            embedding_cache[question_id] = model.encode(texts, convert_to_numpy=True)
+        return embedding_cache[question_id]
+
+# === 4. БД ===
 def init_db():
     conn = sqlite3.connect(DATABASE)
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS answers (
             id INTEGER PRIMARY KEY,
-            question_id INTEGER,
+            question_id INTEGER UNIQUE,
             question_text TEXT,
             answer_25 TEXT,
             answer_50 TEXT,
@@ -25,9 +74,43 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_similarity(a, b):
-    return SequenceMatcher(None, a, b).ratio()
+# === 5. ОЦЕНКА ===
+def evaluate_answer_logic(student_answer, etalons, question_id):
+    original_answer = student_answer.strip().lower()
+    
+    # 🔴 Стоп-слова
+    stop_phrases = ['стрелочк', 'типа', 'как бы', 'вот это', 'на глаз']
+    has_stop = any(phrase in original_answer for phrase in stop_phrases)
 
+    student_emb = model.encode([preprocess(student_answer)], convert_to_numpy=True)
+    etalons_emb = get_embeddings(question_id, etalons)
+    sims = cosine_similarity(student_emb, etalons_emb)[0]  # [sim25, sim50, sim75, sim100]
+
+    # 🎯 Берём НАИЛУЧШЕЕ совпадение — и смотрим, с каким эталоном
+    best_sim = max(sims)
+    best_idx = int(np.argmax(sims))  # 0=25, 1=50, 2=75, 3=100
+
+    # Пороги — теперь НЕ на индекс, а на уровень сходства + эталон
+    if best_idx == 3 and best_sim >= 0.78:   # 100
+        score = 100
+    elif best_idx == 2 and best_sim >= 0.63: # 75 ← снижено с 0.65
+        score = 75
+    elif best_idx == 1 and best_sim >= 0.53: # 50 ← снижено с 0.55
+        score = 50
+    elif best_idx == 0 and best_sim >= 0.45: # 25
+        score = 25
+    else:
+        score = 0
+
+    # 🔽 Коррекция на стоп-слова
+    if has_stop:
+        score = min(score, 25)
+        if score == 25 and best_sim < 0.50:
+            score = 0
+
+    return score
+
+# === 6. ЭНДПОИНТЫ ===
 @app.route('/questions', methods=['GET'])
 def get_questions():
     conn = sqlite3.connect(DATABASE)
@@ -37,55 +120,28 @@ def get_questions():
     conn.close()
     return jsonify([{'id': r[0], 'text': r[1]} for r in rows])
 
-def evaluate_answer_logic(student_answer, etalon_25, etalon_50, etalon_75, etalon_100, min_length=15, min_threshold=0.2):
-    # Проверка длины
-    if len(student_answer.strip()) < min_length:
-        return 0  # 👈 теперь 0, а не 25
-
-    # Сравниваем с эталонами
-    etalons = [
-        (25, etalon_25),
-        (50, etalon_50),
-        (75, etalon_75),
-        (100, etalon_100)
-    ]
-
-    scores = [(score, get_similarity(student_answer, et)) for score, et in etalons]
-
-    # Находим максимальную схожесть
-    best_score, best_similarity = max(scores, key=lambda x: x[1])
-
-    # Если схожесть ниже порога — ставим 0
-    if best_similarity < min_threshold:
-        return 0
-
-    return best_score
-
 @app.route('/evaluate', methods=['POST'])
 def evaluate_answer():
-    try:
-        data = request.json
-        question_id = data['question_id']
-        user_answer = data['answer']
+    data = request.json
+    question_id = int(data['question_id'])
+    user_answer = data['answer']
 
-        conn = sqlite3.connect(DATABASE)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT answer_25, answer_50, answer_75, answer_100 FROM answers WHERE question_id = ?
-        ''', (question_id,))
-        row = cursor.fetchone()
-        conn.close()
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT answer_25, answer_50, answer_75, answer_100 FROM answers WHERE question_id = ?', (question_id,))
+    row = cursor.fetchone()
+    conn.close()
 
-        if not row:
-            return jsonify({'error': 'Question not found'}), 404
+    if not row:
+        return jsonify({'error': 'Question not found'}), 404
 
-        # Вызываем функцию проверки
-        score = evaluate_answer_logic(user_answer, *row, min_length=10, min_threshold=0.5)
-        return jsonify({'score': score})
+    score = evaluate_answer_logic(user_answer, row, question_id)
+    return jsonify({'score': score})
 
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
+# === 7. СТАРТ ===
 if __name__ == '__main__':
     init_db()
-    app.run(debug=True, port=5000)
+    print("\n🚀 Сервер запущен. Только нейросеть. Никаких компромиссов.")
+    print(f"   Модель: {MODEL_PATH}")
+    print("   API: http://localhost:5000/evaluate")
+    app.run(host='0.0.0.0', port=5000, threaded=True)
